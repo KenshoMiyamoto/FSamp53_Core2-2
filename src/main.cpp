@@ -123,6 +123,7 @@ float velocityLpfSumZ = 0;
 
 // ---------- 共通関数 ----------
 
+//モード切り替え時などに座標をリセットする関数
 void resetPrevPoints() {
   prevYA = -1;
   prevYB = -1;
@@ -141,6 +142,7 @@ void resetPrevPoints() {
   prevYC_force = -1;
 }
 
+//画面上部に凡例を書く関数
 void drawModeLabel() {
   M5.Display.fillRect(0, 0, displayWidth, 20, TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -176,6 +178,7 @@ void drawModeLabel() {
   M5.Display.printf("%s", labelC);
 }
 
+//左側にメモリを書く関数
 void drawLeftScale() {
   M5.Display.fillRect(0, 20, LEFT_MARGIN, displayHeight - 20, TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -238,13 +241,14 @@ void drawLeftScale() {
   }
 }
 
+//IMU表示の時だけ、加速度と角速度の境界線を引く関数
 void drawIMUSeparator() {
   if (displayMode == 2) {
     int midY = (displayHeight + 20) / 2;
     M5.Display.drawLine(LEFT_MARGIN, midY, displayWidth - 1, midY, TFT_WHITE);
   }
 }
-
+//波形が右端に行ってから左に戻る時に波形領域だけを消す関数
 void clearPlotArea() {
   // 左スケールと上部ラベル以外の波形領域だけ消す
   M5.Display.fillRect(LEFT_MARGIN, 20, displayWidth - LEFT_MARGIN, displayHeight - 20, TFT_BLACK);
@@ -252,6 +256,7 @@ void clearPlotArea() {
   drawLeftScale();
   drawIMUSeparator();
 }
+
 
 void setup() {
   // M5Stackの初期化
@@ -556,6 +561,8 @@ void loop() {
   int yA_accel, yB_accel, yC_accel;
   int yA_vel, yB_vel, yC_vel;
 
+
+  //データを座標値に変換する際のマッピング処理。モードごとに適切なスケーリングとオフセットを適用して、画面上に表示できるようにする。
   if (displayMode == 0) {
     // 電圧モード: 0-3.3Vを画面高さにマッピング
     yA_accel = constrain(map((long)displayValA, 0, 3300, displayHeight - 1, 20), 20, displayHeight - 1);
