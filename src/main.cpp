@@ -110,6 +110,12 @@ bool displayOn = true;
 // モード表示：0: 生の電圧, 1: オフセット済み電圧, 2: IMU, 3: 力
 int displayMode = 0;
 
+// ロック状態
+bool displayModeLocked = false;
+
+// Bボタン長押し1回判定用
+bool btnBLongPressHandled = false;
+
 // 生データ
 int rawA = 0;
 int rawB = 0;
@@ -160,6 +166,10 @@ void IRAM_ATTR onSampleTimer() {
 }
 
 // ===== 共通関数 =====
+void drawModeLabel();
+void drawLeftScale();
+void drawIMUSeparator();
+
 void startOffsetCollection() {
   collectingOffsets = true;
   sampleCount = 0;
@@ -187,6 +197,45 @@ void resetPrevPoints() {
   prevYC_force = -1;
 }
 
+void refreshModeScreen() {
+  plotX = LEFT_MARGIN;
+  resetPrevPoints();
+  M5.Display.fillScreen(TFT_BLACK);
+  drawModeLabel();
+  drawLeftScale();
+  drawIMUSeparator();
+}
+
+void handleSerialCommand() {
+  while (Serial.available() > 0) {
+    char cmd = (char)Serial.read();
+
+    // 改行などは無視
+    if (cmd == '\n' || cmd == '\r' || cmd == ' ') continue;
+
+    if (cmd == 'v') {
+      displayMode = 0;
+      refreshModeScreen();
+      Serial.println("# command: Raw Volt");
+    } else if (cmd == 'o') {
+      displayMode = 1;
+      refreshModeScreen();
+      Serial.println("# command: Off Volt");
+    } else if (cmd == 'I') {
+      displayMode = 2;
+      refreshModeScreen();
+      Serial.println("# command: IMU");
+    } else if (cmd == 'f') {
+      displayMode = 3;
+      refreshModeScreen();
+      Serial.println("# command: Force");
+    } else if (cmd == 'O') {
+      startOffsetCollection();
+      Serial.println("# command: Offset start");
+    }
+  }
+}
+
 // 画面上部にモード・凡例・バッテリー残量を表示
 void drawModeLabel() {
   M5.Display.fillRect(0, 0, displayWidth, 20, TFT_BLACK);
@@ -196,6 +245,12 @@ void drawModeLabel() {
 
   const char* modeStr[] = {"Raw Volt", "Off Volt", "IMU", "Force"};
   M5.Display.printf("Mode: %s", modeStr[displayMode]);
+
+  // ロック状態表示（中央）
+  if (displayModeLocked) {
+    M5.Display.setCursor(displayWidth / 2 - 15, 5);
+    M5.Display.printf("LOCKED");
+  }
 
   // バッテリー残量表示
   int batteryPercent = M5.Power.getBatteryLevel();
@@ -461,7 +516,6 @@ void outputSerial() {
     Serial.println(currentSampleRate);
 
   } else if (displayMode == 1) {
-    // Off Volt は offset差分を V 単位で出力
     float outA = (valA - offsetA) / 1000.0f;
     float outB = (valB - offsetB) / 1000.0f;
     float outC = (valC - offsetC) / 1000.0f;
@@ -532,7 +586,6 @@ void drawGraph() {
     yC_vel = yC_accel;
 
   } else if (displayMode == 1) {
-    // Off Volt を中心0、±2V幅に変更
     yA_accel = constrain(map((long)displayValA, -2000, 2000, displayHeight - 1, 20), 20, displayHeight - 1);
     yB_accel = constrain(map((long)displayValB, -2000, 2000, displayHeight - 1, 20), 20, displayHeight - 1);
     yC_accel = constrain(map((long)displayValC, -2000, 2000, displayHeight - 1, 20), 20, displayHeight - 1);
@@ -646,6 +699,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("=== M5Stack Serial Start ===");
+  Serial.println("# commands: v=RawVolt, o=OffVolt, I=IMU, f=Force, O=Offset");
 
   for (int i = 0; i < LPF_SIZE; i++) {
     lpfBufA[i] = 0;
@@ -665,9 +719,7 @@ void setup() {
     forceLpfBufZ[i] = 0;
   }
 
-  drawModeLabel();
-  drawLeftScale();
-  drawIMUSeparator();
+  refreshModeScreen();
 
   rateMeasureMillis = millis();
   currentSampleRate = 0.0f;
@@ -696,16 +748,26 @@ void loop() {
     startOffsetCollection();
   }
 
-  if (M5.BtnB.wasPressed()) {
-    displayOn = !displayOn;
+  // ボタンB: 3秒長押しでロック/解除（押している間に1回だけ）
+  if (M5.BtnB.isPressed()) {
+    if (M5.BtnB.pressedFor(3000) && !btnBLongPressHandled) {
+      displayModeLocked = !displayModeLocked;
+      btnBLongPressHandled = true;
+      refreshModeScreen();
+    }
+  } else {
+    // 指を離したら次の長押しを受け付ける
+    btnBLongPressHandled = false;
   }
 
-  if (M5.BtnC.wasPressed()) {
+  // ボタンC: モード切り替え（ロックされていない場合のみ）
+  if (M5.BtnC.wasPressed() && !displayModeLocked) {
     displayMode = (displayMode + 1) % 4;
-    plotX = LEFT_MARGIN;
-    resetPrevPoints();
-    clearPlotArea();
+    refreshModeScreen();
   }
+
+  // シリアルコマンド
+  handleSerialCommand();
 
   updateDisplayedSampleRate();
 
