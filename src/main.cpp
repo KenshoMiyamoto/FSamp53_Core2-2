@@ -743,8 +743,8 @@ void setup() {
 void loop() {
   M5.update();
 
-  // ボタンA: いつでもオフセット再取得
-  if (M5.BtnA.wasPressed()) {
+  // ボタンA: オフセット再取得（ロックされていない場合のみ）
+  if (M5.BtnA.wasPressed() && !displayModeLocked) {
     startOffsetCollection();
   }
 
