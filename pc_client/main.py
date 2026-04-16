@@ -24,6 +24,7 @@ from receiver import UDPReceiver
 from commander import CommandSender
 from saver import DataSaver
 from packet import DecodedPacket
+from plotter import RealtimePlotter
 
 # ─── ロギング設定 ──────────────────────────────────────────
 logging.basicConfig(
@@ -44,16 +45,22 @@ class MeasurementApp:
         )
         self.commander = CommandSender()
         self.saver = DataSaver()
+        self.plotter = RealtimePlotter()
         self.measurement_start_time: float | None = None
         self._is_measuring = False
 
     def _on_packet(self, pkt: DecodedPacket):
-        """パケットデコード完了時のコールバック (リアルタイムログ用)"""
-        # 大量のログが出るためデバッグ時のみ有効化
-        logger.debug(
-            f"Device {pkt.device_id} | Seq {pkt.sequence_no} | "
-            f"Samples: {len(pkt.samples)}"
-        )
+        """パケットデコード完了時のコールバック (グラフ描画用のデータ送信)"""
+        # グラフ描画バッファへデータ追加
+        if self._is_measuring:
+            dev_id = pkt.device_id
+            for sample in pkt.samples:
+                # x軸はマイクロ秒を秒に変換した値
+                t = sample.timestamp_us / 1_000_000.0
+                # CH10-12 (インデックス 9,10,11) の「力」のデータを取り出す
+                if len(sample.channels) >= 12:
+                    fx, fy, fz = sample.channels[9], sample.channels[10], sample.channels[11]
+                    self.plotter.add_data(dev_id, t, fx, fy, fz)
 
     def start_measurement(self):
         """計測を開始する"""
@@ -142,8 +149,8 @@ class MeasurementApp:
             )
         print("=" * 60)
 
-    def run(self):
-        """メインループ (CLI)"""
+    def run_cli(self):
+        """バックグラウンドスレッドで実行するCLIループ"""
         print()
         print("=" * 60)
         print("  M5Stack UDP 受信クライアント")
@@ -186,11 +193,29 @@ class MeasurementApp:
                     self.stop_measurement()
                 self.commander.close()
                 print("👋 終了します")
-                break
+                import os
+                os._exit(0)  # plt.show() のブロッキングごと強制終了
             elif cmd == "":
                 continue
             else:
                 print(f"⚠ 不明なコマンド: {cmd}")
+
+    def run(self):
+        """メイン処理 (CLIをスレッド起動 + メインスレッドでグラフ描画)"""
+        import threading
+        cli_thread = threading.Thread(target=self.run_cli, daemon=True)
+        cli_thread.start()
+
+        try:
+            # matplotlib はメインスレッドで実行する必要がある
+            self.plotter.show()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if self._is_measuring:
+                self.stop_measurement()
+            self.commander.close()
+            print("👋 終了しました")
 
 
 if __name__ == "__main__":
