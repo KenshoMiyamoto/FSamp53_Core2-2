@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "M5Unified.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
 
 #define PIN_INA 35
 #define PIN_INB 36
@@ -14,6 +16,36 @@ const uint32_t SAMPLE_RATE_HZ = 600;                    // 目標サンプリン
 const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE_HZ;
 const int DRAW_EVERY_N_SAMPLES = 3;                    // 3 -> 200Hz描画
 const int SERIAL_EVERY_N_SAMPLES = 3;                  // 3 -> 200Hz送信
+
+// ===== Wi-Fi / UDP 設定 =====
+const char* WIFI_SSID     = "YOUR_SSID";       // ← 使用するWi-FiのSSIDに変更
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";   // ← 使用するWi-Fiのパスワードに変更
+const uint8_t DEVICE_ID   = 1;                 // ← このM5Stackの識別番号 (1～6)
+
+const uint16_t CMD_PORT  = 8001;   // コマンド待受ポート
+const uint16_t DATA_PORT = 8000;   // データ送信先ポート (PC側)
+const uint16_t HEADER_MARKER = 0xAAAA;
+const uint16_t FOOTER_MARKER = 0x5555;
+const int SAMPLES_PER_PACKET = 10;           // 1パケットあたりのサンプル数
+const int NUM_CHANNELS = 12;                 // float32 × 12ch
+const int SAMPLE_BYTES = 4 + NUM_CHANNELS * 4;  // Timestamp(4) + 12ch×4 = 52
+const int PACKET_SIZE = 2 + 1 + 4 + SAMPLES_PER_PACKET * SAMPLE_BYTES + 2;  // 529 bytes
+const int UDP_EVERY_N_SAMPLES = 3;           // 600Hz / 3 = 200Hz でUDP用サンプル取得
+
+// UDP オブジェクト
+WiFiUDP udpCmd;    // コマンド受信用
+WiFiUDP udpData;   // データ送信用
+
+// UDP 通信状態
+bool udpMeasuring = false;         // 計測中フラグ
+IPAddress pcIP;                    // STARTコマンド送信元のIP
+uint32_t udpSequenceNo = 0;        // パケットシーケンス番号
+uint32_t udpTimerOffset = 0;       // START受信時の micros() 値
+
+// UDP 送信バッファ
+uint8_t udpPacketBuf[PACKET_SIZE];
+int udpSampleCount = 0;            // バッファ内のサンプル数
+uint32_t udpCounter = 0;           // UDP用間引きカウンタ
 
 // マトリクス
 const float MATRIX[3][3] = {
@@ -169,6 +201,119 @@ void IRAM_ATTR onSampleTimer() {
 void drawModeLabel();
 void drawLeftScale();
 void drawIMUSeparator();
+
+// ===== UDP パケット組み立て・送信 =====
+void udpBufferSample() {
+  if (!udpMeasuring) return;
+
+  // タイムスタンプ: START受信からの経過時間 (マイクロ秒)
+  uint32_t timestamp_us = micros() - udpTimerOffset;
+
+  // バッファ内の書き込み位置を計算
+  // Header(2) + DeviceID(1) + SeqNo(4) + sampleIndex * SAMPLE_BYTES
+  int offset = 2 + 1 + 4 + udpSampleCount * SAMPLE_BYTES;
+
+  // Timestamp (Big Endian)
+  udpPacketBuf[offset++] = (timestamp_us >> 24) & 0xFF;
+  udpPacketBuf[offset++] = (timestamp_us >> 16) & 0xFF;
+  udpPacketBuf[offset++] = (timestamp_us >> 8)  & 0xFF;
+  udpPacketBuf[offset++] =  timestamp_us        & 0xFF;
+
+  // 12ch センサデータ (float32, Big Endian)
+  // CH 1-3: センサ値 (オフセット補正済み電圧 [V])
+  float ch[NUM_CHANNELS];
+  ch[0]  = (valA - offsetA) / 1000.0f;
+  ch[1]  = (valB - offsetB) / 1000.0f;
+  ch[2]  = (valC - offsetC) / 1000.0f;
+  // CH 4-6: 加速度
+  ch[3]  = accelValX;
+  ch[4]  = accelValY;
+  ch[5]  = accelValZ;
+  // CH 7-9: 角速度
+  ch[6]  = gyroValX;
+  ch[7]  = gyroValY;
+  ch[8]  = gyroValZ;
+  // CH 10-12: 荷重 (力)
+  ch[9]  = forceValX;
+  ch[10] = forceValY;
+  ch[11] = forceValZ;
+
+  for (int i = 0; i < NUM_CHANNELS; i++) {
+    uint32_t bits;
+    memcpy(&bits, &ch[i], 4);
+    udpPacketBuf[offset++] = (bits >> 24) & 0xFF;
+    udpPacketBuf[offset++] = (bits >> 16) & 0xFF;
+    udpPacketBuf[offset++] = (bits >> 8)  & 0xFF;
+    udpPacketBuf[offset++] =  bits        & 0xFF;
+  }
+
+  udpSampleCount++;
+
+  // N サンプル溜まったらパケット送信
+  if (udpSampleCount >= SAMPLES_PER_PACKET) {
+    // Header (Big Endian)
+    udpPacketBuf[0] = (HEADER_MARKER >> 8) & 0xFF;
+    udpPacketBuf[1] =  HEADER_MARKER       & 0xFF;
+    // Device ID
+    udpPacketBuf[2] = DEVICE_ID;
+    // Sequence No. (Big Endian)
+    udpPacketBuf[3] = (udpSequenceNo >> 24) & 0xFF;
+    udpPacketBuf[4] = (udpSequenceNo >> 16) & 0xFF;
+    udpPacketBuf[5] = (udpSequenceNo >> 8)  & 0xFF;
+    udpPacketBuf[6] =  udpSequenceNo        & 0xFF;
+    // Footer (Big Endian)
+    int footerOffset = 2 + 1 + 4 + SAMPLES_PER_PACKET * SAMPLE_BYTES;
+    udpPacketBuf[footerOffset]     = (FOOTER_MARKER >> 8) & 0xFF;
+    udpPacketBuf[footerOffset + 1] =  FOOTER_MARKER       & 0xFF;
+
+    // 送信
+    udpData.beginPacket(pcIP, DATA_PORT);
+    udpData.write(udpPacketBuf, PACKET_SIZE);
+    udpData.endPacket();
+
+    udpSequenceNo++;
+    udpSampleCount = 0;
+  }
+}
+
+void checkUDPCommand() {
+  int packetSize = udpCmd.parsePacket();
+  if (packetSize <= 0) return;
+
+  char buf[16];
+  int len = udpCmd.read(buf, sizeof(buf) - 1);
+  if (len <= 0) return;
+  buf[len] = '\0';
+
+  // 送信元IPを記録
+  IPAddress remoteIP = udpCmd.remoteIP();
+
+  if (strcmp(buf, "START") == 0) {
+    pcIP = remoteIP;
+    udpTimerOffset = micros();   // 内部タイマーを0リセット
+    udpSequenceNo = 0;
+    udpSampleCount = 0;
+    udpCounter = 0;
+    udpMeasuring = true;
+    Serial.printf("UDP START from %s\n", pcIP.toString().c_str());
+
+    // 画面に状態表示
+    M5.Display.fillRect(0, displayHeight - 15, displayWidth, 15, TFT_BLACK);
+    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Display.setCursor(5, displayHeight - 12);
+    M5.Display.printf("UDP: MEASURING -> %s", pcIP.toString().c_str());
+
+  } else if (strcmp(buf, "STOP") == 0) {
+    udpMeasuring = false;
+    Serial.println("UDP STOP");
+
+    // 画面に状態表示
+    M5.Display.fillRect(0, displayHeight - 15, displayWidth, 15, TFT_BLACK);
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.setCursor(5, displayHeight - 12);
+    M5.Display.printf("UDP: STANDBY (seq=%lu)", udpSequenceNo);
+  }
+}
 
 void startOffsetCollection() {
   collectingOffsets = true;
@@ -701,6 +846,45 @@ void setup() {
   Serial.println("=== M5Stack Serial Start ===");
   Serial.println("# commands: v=RawVolt, o=OffVolt, I=IMU, f=Force, O=Offset");
 
+  // ===== Wi-Fi 接続 =====
+  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Display.setCursor(10, 40);
+  M5.Display.printf("Connecting to %s...", WIFI_SSID);
+  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiTimeout++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    M5.Display.setCursor(10, 55);
+    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Display.printf("IP: %s", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nWiFi connection failed!");
+    M5.Display.setCursor(10, 55);
+    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+    M5.Display.printf("WiFi FAILED");
+  }
+
+  // ===== UDP コマンド待受ポート開始 =====
+  udpCmd.begin(CMD_PORT);
+  Serial.printf("UDP command port: %d (waiting for START)\n", CMD_PORT);
+  Serial.printf("Device ID: %d\n", DEVICE_ID);
+
+  M5.Display.setCursor(10, 70);
+  M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5.Display.printf("Dev:%d  CMD:%d  Waiting...", DEVICE_ID, CMD_PORT);
+
+  delay(2000);
+
   for (int i = 0; i < LPF_SIZE; i++) {
     lpfBufA[i] = 0;
     lpfBufB[i] = 0;
@@ -742,6 +926,9 @@ void setup() {
 
 void loop() {
   M5.update();
+
+  // ===== UDP コマンドチェック =====
+  checkUDPCommand();
 
   // ボタンA: オフセット再取得（ロックされていない場合のみ）
   if (M5.BtnA.wasPressed() && !displayModeLocked) {
@@ -791,5 +978,12 @@ void loop() {
   if (drawCounter >= DRAW_EVERY_N_SAMPLES) {
     drawCounter = 0;
     drawGraph();
+  }
+
+  // ===== UDP データ送信 (600Hz / 3 = 200Hz) =====
+  udpCounter++;
+  if (udpCounter >= UDP_EVERY_N_SAMPLES) {
+    udpCounter = 0;
+    udpBufferSample();
   }
 }
