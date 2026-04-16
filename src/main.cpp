@@ -1,3 +1,8 @@
+// 作成日: 2026-03-24
+// 目的: M5Stack Core2で3chアナログ入力をサンプリングし、LPF処理・IMU変換・力推定を行いつつ
+//       画面にグラフ表示およびシリアル出力を行うサンプルアプリケーション
+//       ボタンでモード切替とオフセット収集制御が可能
+
 #include <Arduino.h>
 #include "M5Unified.h"
 
@@ -490,7 +495,7 @@ void processOneSample() {
     lpfFull = true;
   }
 }
-
+// サンプリングレートの計算と更新
 void updateDisplayedSampleRate() {
   unsigned long nowMillis = millis();
   if (nowMillis - rateMeasureMillis >= 1000) {
@@ -719,8 +724,9 @@ void setup() {
     forceLpfBufZ[i] = 0;
   }
 
+  // 初期画面描画
   refreshModeScreen();
-
+ // サンプリングレート計測の初期化
   rateMeasureMillis = millis();
   currentSampleRate = 0.0f;
 
@@ -768,28 +774,36 @@ void loop() {
 
   // シリアルコマンド
   handleSerialCommand();
-
+ // タイマー割り込みで増えた回数から、現在のサンプリングレートを更新
   updateDisplayedSampleRate();
 
+  // onSampleTimer() が1回呼ばれるたびに pendingSamples は1増える
+  // ここでは、その「処理待ちサンプル」があるか確認する
   if (pendingSamples == 0) {
-    return;
+    return;// まだ新しいサンプル時刻が来ていない
   }
 
+  // 処理待ちサンプルを1件取り出す
+  // pendingSamples は割り込み関数と共有しているため、更新中だけ割り込みを止める
   noInterrupts();
   pendingSamples--;
   interrupts();
-
+  //データ取得と処理
   processOneSample();
 
+  // サンプル処理のたびにシリアル送信用カウンタを進める
+  // 一定回数たまったら、1回だけシリアル出力する
   serialCounter++;
   if (serialCounter >= SERIAL_EVERY_N_SAMPLES) {
-    serialCounter = 0;
-    outputSerial();
+    serialCounter = 0;   
+    outputSerial();     
   }
 
+  // サンプル処理のたびに描画用カウンタを進める
+  // 一定回数たまったら、1回だけ画面描画する
   drawCounter++;
   if (drawCounter >= DRAW_EVERY_N_SAMPLES) {
-    drawCounter = 0;
-    drawGraph();
+    drawCounter = 0;     
+    drawGraph();        
   }
 }
